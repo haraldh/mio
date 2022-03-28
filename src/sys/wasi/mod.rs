@@ -20,6 +20,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::sys::event::token;
 #[cfg(feature = "net")]
 use crate::{Interest, Token};
 
@@ -63,6 +64,7 @@ impl Selector {
 
     pub(crate) fn select(&self, events: &mut Events, timeout: Option<Duration>) -> io::Result<()> {
         events.clear();
+        let mut wasi_events = Vec::<wasi::Event>::with_capacity(events.capacity() * 2);
 
         let mut subscriptions = self.subscriptions.lock().unwrap();
 
@@ -74,11 +76,11 @@ impl Selector {
 
         // `poll_oneoff` needs the same number of events as subscriptions.
         let length = subscriptions.len();
-        events.reserve(length);
+        wasi_events.reserve(length);
 
-        debug_assert!(events.capacity() >= length);
-
-        let res = unsafe { wasi::poll_oneoff(subscriptions.as_ptr(), events.as_mut_ptr(), length) };
+        debug_assert!(wasi_events.capacity() >= length);
+        let res =
+            unsafe { wasi::poll_oneoff(subscriptions.as_ptr(), wasi_events.as_mut_ptr(), length) };
 
         // Remove the timeout subscription we possibly added above.
         if timeout.is_some() {
@@ -95,16 +97,17 @@ impl Selector {
         match res {
             Ok(n_events) => {
                 // Safety: `poll_oneoff` initialises the `events` for us.
-                unsafe { events.set_len(n_events) };
+                unsafe { wasi_events.set_len(n_events) };
 
                 // Remove the timeout event.
                 if timeout.is_some() {
-                    if let Some(index) = events.iter().position(is_timeout_event) {
-                        events.swap_remove(index);
+                    if let Some(index) = wasi_events.iter().position(is_timeout_event) {
+                        wasi_events.swap_remove(index);
                     }
                 }
+                check_errors(&wasi_events)?;
 
-                check_errors(&events)
+                combine_events(events, &wasi_events)
             }
             Err(err) => Err(io_err(err)),
         }
@@ -231,12 +234,29 @@ fn is_timeout_event(event: &wasi::Event) -> bool {
 }
 
 /// Check all events for possible errors, it returns the first error found.
-fn check_errors(events: &[Event]) -> io::Result<()> {
+fn check_errors(events: &[wasi::Event]) -> io::Result<()> {
     for event in events {
         if event.error != wasi::ERRNO_SUCCESS {
             return Err(io_err(event.error));
         }
     }
+    Ok(())
+}
+
+fn combine_events(events: &mut Events, wasi_events: &[wasi::Event]) -> io::Result<()> {
+    for wasi_event in wasi_events {
+        let predicate = |event: &&mut Event| crate::Token(wasi_event.userdata as _) == token(event);
+
+        match events.iter_mut().filter(predicate).last() {
+            None => events.push((*wasi_event).into()),
+            Some(event) => {
+                if event.combine_other(wasi_event).is_none() {
+                    events.push((*wasi_event).into())
+                };
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -248,7 +268,59 @@ fn io_err(errno: wasi::Errno) -> io::Error {
 
 pub(crate) type Events = Vec<Event>;
 
-pub(crate) type Event = wasi::Event;
+#[derive(Clone, Default)]
+pub(crate) struct CombinedEvent {
+    pub(crate) read: Option<wasi::Event>,
+    pub(crate) write: Option<wasi::Event>,
+}
+
+impl From<wasi::Event> for CombinedEvent {
+    #[inline]
+    fn from(val: wasi::Event) -> Self {
+        match val.type_ {
+            wasi::EVENTTYPE_FD_READ => Self {
+                read: Some(val),
+                ..Default::default()
+            },
+            wasi::EVENTTYPE_FD_WRITE => Self {
+                write: Some(val),
+                ..Default::default()
+            },
+            _ => panic!(),
+        }
+    }
+}
+
+impl CombinedEvent {
+    #[inline]
+    pub(crate) fn combine_other(&mut self, wasi_event: &wasi::Event) -> Option<&mut Self> {
+        match wasi_event.type_ {
+            wasi::EVENTTYPE_FD_READ => match self {
+                CombinedEvent {
+                    read: None,
+                    write: Some(_),
+                } => {
+                    self.read.replace(*wasi_event);
+                    Some(self)
+                }
+                _ => None,
+            },
+            wasi::EVENTTYPE_FD_WRITE => match self {
+                CombinedEvent {
+                    read: Some(_),
+                    write: None,
+                } => {
+                    self.write.replace(*wasi_event);
+                    Some(self)
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+}
+
+pub(crate) type Event = CombinedEvent;
 
 pub(crate) mod event {
     use std::fmt;
@@ -257,15 +329,23 @@ pub(crate) mod event {
     use crate::Token;
 
     pub(crate) fn token(event: &Event) -> Token {
-        Token(event.userdata as usize)
+        match (event.read, event.write) {
+            (None, None) => panic!(),
+            (Some(read), None) => Token(read.userdata as usize),
+            (None, Some(write)) => Token(write.userdata as usize),
+            (Some(read), Some(write)) => {
+                debug_assert!(read.userdata == write.userdata);
+                Token(write.userdata as usize)
+            }
+        }
     }
 
     pub(crate) fn is_readable(event: &Event) -> bool {
-        event.type_ == wasi::EVENTTYPE_FD_READ
+        matches!(event.read, Some(read) if read.type_ == wasi::EVENTTYPE_FD_READ)
     }
 
     pub(crate) fn is_writable(event: &Event) -> bool {
-        event.type_ == wasi::EVENTTYPE_FD_WRITE
+        matches!(event.write, Some(write) if write.type_ == wasi::EVENTTYPE_FD_WRITE)
     }
 
     pub(crate) fn is_error(_: &Event) -> bool {
@@ -276,15 +356,15 @@ pub(crate) mod event {
     }
 
     pub(crate) fn is_read_closed(event: &Event) -> bool {
-        event.type_ == wasi::EVENTTYPE_FD_READ
-            // Safety: checked the type of the union above.
-            && (event.fd_readwrite.flags & wasi::EVENTRWFLAGS_FD_READWRITE_HANGUP) != 0
+        // Safety: checked the type of the union above.
+        matches!(event.read, Some(read) if read.type_ == wasi::EVENTTYPE_FD_READ
+            && (read.fd_readwrite.flags & wasi::EVENTRWFLAGS_FD_READWRITE_HANGUP) != 0)
     }
 
     pub(crate) fn is_write_closed(event: &Event) -> bool {
-        event.type_ == wasi::EVENTTYPE_FD_WRITE
-            // Safety: checked the type of the union above.
-            && (event.fd_readwrite.flags & wasi::EVENTRWFLAGS_FD_READWRITE_HANGUP) != 0
+        // Safety: checked the type of the union above.
+        matches!(event.write, Some(write) if write.type_ == wasi::EVENTTYPE_FD_WRITE
+            && (write.fd_readwrite.flags & wasi::EVENTRWFLAGS_FD_READWRITE_HANGUP) != 0)
     }
 
     pub(crate) fn is_priority(_: &Event) -> bool {
@@ -333,10 +413,18 @@ pub(crate) mod event {
         }
 
         f.debug_struct("Event")
-            .field("userdata", &event.userdata)
-            .field("error", &event.error)
-            .field("type", &TypeDetails(event.type_))
-            .field("fd_readwrite", &EventFdReadwriteDetails(event.fd_readwrite))
+            .field("userdata", &token(event))
+            .field("error", &is_error(event))
+            .field("read.type", &event.read.map(|e| TypeDetails(e.type_)))
+            .field(
+                "read.fd_readwrite",
+                &event.read.map(|e| EventFdReadwriteDetails(e.fd_readwrite)),
+            )
+            .field("write.type", &event.write.map(|e| TypeDetails(e.type_)))
+            .field(
+                "write.fd_readwrite",
+                &event.write.map(|e| EventFdReadwriteDetails(e.fd_readwrite)),
+            )
             .finish()
     }
 }
