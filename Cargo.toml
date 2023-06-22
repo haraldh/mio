@@ -31,6 +31,8 @@ include       = [
 # By default Mio only provides a shell implementation.
 default = ["log"]
 
+eventfd = []
+
 # Enables the `Poll` and `Registry` types.
 os-poll = []
 # Enables additional OS specific extensions, e.g. Unix `pipe(2)`.
